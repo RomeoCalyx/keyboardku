@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag matches app version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+          $gradle = Get-Content "android/app/build.gradle.kts" -Raw
+          $appVersion = [regex]::Match($gradle, 'versionName\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $appVersion -or $appVersion -ne $tagVersion) {
+            throw "Tag $($env:GITHUB_REF_NAME) does not match app version $appVersion"
+          }
+          "VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
+
+      - name: Test Android app
+        working-directory: android
+        run: .\gradlew.bat test --console=plain --no-daemon
+
+      - name: Build Android release APK
+        working-directory: android
+        run: .\gradlew.bat assembleRelease --console=plain --no-daemon
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test Windows server
+        run: cargo test --locked --manifest-path server/Cargo.toml
+
+      - name: Build Windows release server
+        run: cargo build --release --locked --manifest-path server/Cargo.toml --bin keyboardku-server
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $assets = "release-assets"
+          New-Item -ItemType Directory -Force $assets | Out-Null
+          $apk = Join-Path $assets "KeyboardKu-$env:VERSION.apk"
+          $exe = Join-Path $assets "KeyboardKu-$env:VERSION-windows-x64.exe"
+          Copy-Item "android/app/build/outputs/apk/release/app-release.apk" $apk
+          Copy-Item "server/target/release/keyboardku-server.exe" $exe
+          $lines = @(
+            "$((Get-FileHash $apk -Algorithm SHA256).Hash.ToLowerInvariant())  $(Split-Path $apk -Leaf)",
+            "$((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant())  $(Split-Path $exe -Leaf)"
+          )
+          [System.IO.File]::WriteAllLines(
+            (Join-Path $assets "SHA256SUMS.txt"),
+            $lines,
+            [System.Text.Encoding]::ASCII
+          )
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create $env:GITHUB_REF_NAME release-assets/* `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "KeyboardKu $env:GITHUB_REF_NAME" `
+            --generate-notes
