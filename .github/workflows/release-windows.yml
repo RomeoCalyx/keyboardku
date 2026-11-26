@@ -1,0 +1,50 @@
+name: Build Windows server
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/release-windows.yml"
+      - "server/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test server
+        run: cargo test --locked --manifest-path server/Cargo.toml
+
+      - name: Build release server
+        run: cargo build --release --locked --manifest-path server/Cargo.toml --bin keyboardku-server
+
+      - name: Write checksum
+        shell: pwsh
+        run: |
+          $exe = "server/target/release/keyboardku-server.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  keyboardku-server.exe" | Set-Content -Path "server/target/release/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyboardku-server-windows-x64
+          path: |
+            server/target/release/keyboardku-server.exe
+            server/target/release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
